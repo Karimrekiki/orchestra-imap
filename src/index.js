@@ -149,6 +149,69 @@ app.post('/attachment', async (req, res) => {
   }
 });
 
+// Search for emails by text query (for text invoice scanning)
+app.post('/search-text', async (req, res) => {
+  const { email, password, fromFilter, subjectFilter, daysBack = 30, maxResults = 50 } = req.body;
+
+  if (!email || !password) {
+    return res.status(400).json({ error: 'Email and password required' });
+  }
+
+  let client = null;
+  try {
+    client = await createClient(email, password);
+    await client.mailboxOpen('INBOX');
+
+    const sinceDate = new Date();
+    sinceDate.setDate(sinceDate.getDate() - daysBack);
+
+    // Build IMAP search criteria
+    // Note: IMAP search is limited - we can search by FROM, SUBJECT, SINCE
+    const searchCriteria = { since: sinceDate };
+
+    // Add FROM filter if provided
+    if (fromFilter) {
+      searchCriteria.from = fromFilter;
+    }
+
+    // Add SUBJECT filter if provided
+    if (subjectFilter) {
+      searchCriteria.subject = subjectFilter;
+    }
+
+    const messages = [];
+    let count = 0;
+
+    for await (const msg of client.fetch(
+      searchCriteria,
+      { envelope: true, bodyStructure: true, uid: true }
+    )) {
+      if (count >= maxResults) break;
+
+      // Check if message has PDF attachments
+      const pdfAttachments = extractPdfAttachments(msg.bodyStructure);
+      const hasPdf = pdfAttachments.length > 0;
+
+      messages.push({
+        uid: msg.uid,
+        subject: msg.envelope.subject,
+        from: formatAddress(msg.envelope.from?.[0]),
+        date: msg.envelope.date?.toISOString(),
+        hasPdf,
+        attachments: pdfAttachments
+      });
+      count++;
+    }
+
+    await client.logout();
+    res.json({ messages });
+  } catch (err) {
+    res.status(500).json({ error: err.message || 'Search failed' });
+  } finally {
+    if (client) try { await client.logout(); } catch {}
+  }
+});
+
 // Get full message
 app.post('/message', async (req, res) => {
   const { email, password, messageUid } = req.body;
