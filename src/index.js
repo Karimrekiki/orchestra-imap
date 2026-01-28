@@ -125,19 +125,24 @@ app.post('/attachment', async (req, res) => {
     client = await createClient(email, password);
     await client.mailboxOpen('INBOX');
 
-    const download = await client.download(messageUid, partId, { uid: true });
+    // Use fetchOne with bodyParts to get the specific part
+    const msg = await client.fetchOne(
+      messageUid,
+      { bodyParts: [partId] },
+      { uid: true }
+    );
 
-    const chunks = [];
-    for await (const chunk of download.content) {
-      chunks.push(chunk);
+    if (!msg || !msg.bodyParts || !msg.bodyParts.has(partId)) {
+      return res.status(404).json({ error: 'Attachment not found' });
     }
 
-    const buffer = Buffer.concat(chunks);
+    const buffer = msg.bodyParts.get(partId);
     const base64 = buffer.toString('base64');
 
     await client.logout();
     res.json({ base64 });
   } catch (err) {
+    console.error('Attachment download error:', err);
     res.status(500).json({ error: err.message || 'Download failed' });
   } finally {
     if (client) try { await client.logout(); } catch {}
