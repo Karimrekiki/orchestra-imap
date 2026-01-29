@@ -68,7 +68,7 @@ app.post('/test', async (req, res) => {
 // Search for emails with PDF attachments
 // Returns all matching emails (no artificial limit) with total count
 app.post('/search', async (req, res) => {
-  const { email, password, daysBack = 30, maxResults = 500 } = req.body;
+  const { email, password, daysBack = 365, maxResults = 5000 } = req.body;
 
   if (!email || !password) {
     return res.status(400).json({ error: 'Email and password required' });
@@ -79,8 +79,10 @@ app.post('/search', async (req, res) => {
     client = await createClient(email, password);
     await client.mailboxOpen('INBOX');
 
+    // Handle "all time" scan when daysBack is very large (3650 = ~10 years)
+    const effectiveDaysBack = daysBack >= 3650 ? 3650 : (daysBack || 365);
     const sinceDate = new Date();
-    sinceDate.setDate(sinceDate.getDate() - daysBack);
+    sinceDate.setDate(sinceDate.getDate() - effectiveDaysBack);
 
     const messages = [];
     let totalEmailsScanned = 0;
@@ -134,24 +136,79 @@ app.post('/attachment', async (req, res) => {
     client = await createClient(email, password);
     await client.mailboxOpen('INBOX');
 
-    // Use fetchOne with bodyParts to get the specific part
-    const msg = await client.fetchOne(
-      messageUid,
-      { bodyParts: [partId] },
-      { uid: true }
-    );
+    // Try to fetch the attachment using the partId
+    // partId format can be "1", "1.2", "2.1", etc.
+    console.log(`[Attachment] Fetching UID ${messageUid}, part ${partId}`);
 
-    if (!msg || !msg.bodyParts || !msg.bodyParts.has(partId)) {
-      return res.status(404).json({ error: 'Attachment not found' });
+    try {
+      const msg = await client.fetchOne(
+        messageUid,
+        { bodyParts: [partId] },
+        { uid: true }
+      );
+
+      if (!msg || !msg.bodyParts || !msg.bodyParts.has(partId)) {
+        // Try alternative part ID format (some servers use different numbering)
+        console.log(`[Attachment] Part ${partId} not found, trying alternatives...`);
+
+        // Get message structure to find correct part
+        const structMsg = await client.fetchOne(
+          messageUid,
+          { bodyStructure: true },
+          { uid: true }
+        );
+
+        if (structMsg?.bodyStructure) {
+          const allParts = [];
+          function collectParts(part, path = '1') {
+            allParts.push({ path, part });
+            if (part.childNodes) {
+              part.childNodes.forEach((child, idx) => {
+                collectParts(child, `${path}.${idx + 1}`);
+              });
+            }
+          }
+          collectParts(structMsg.bodyStructure);
+          console.log(`[Attachment] Available parts: ${allParts.map(p => p.path).join(', ')}`);
+        }
+
+        return res.status(404).json({ error: `Attachment part ${partId} not found` });
+      }
+
+      const buffer = msg.bodyParts.get(partId);
+      const base64 = buffer.toString('base64');
+
+      await client.logout();
+      res.json({ base64 });
+    } catch (fetchErr) {
+      console.error(`[Attachment] Fetch error for part ${partId}:`, fetchErr.message);
+
+      // If the fetch fails, try downloading the entire message source and extract
+      console.log(`[Attachment] Trying full message download as fallback...`);
+      const fullMsg = await client.fetchOne(
+        messageUid,
+        { source: true, bodyStructure: true },
+        { uid: true }
+      );
+
+      if (fullMsg?.source) {
+        // Try to extract the attachment from the raw source
+        // This is a fallback for when bodyParts fetch fails
+        const source = fullMsg.source.toString('utf-8');
+
+        // Find base64 content after the part boundary
+        const base64Match = source.match(/Content-Transfer-Encoding:\s*base64[\r\n]+[\r\n]+([\s\S]+?)(?=--|\r\n\r\n--)/i);
+        if (base64Match) {
+          const base64Content = base64Match[1].replace(/[\r\n\s]/g, '');
+          res.json({ base64: base64Content });
+          return;
+        }
+      }
+
+      throw fetchErr;
     }
-
-    const buffer = msg.bodyParts.get(partId);
-    const base64 = buffer.toString('base64');
-
-    await client.logout();
-    res.json({ base64 });
   } catch (err) {
-    console.error('Attachment download error:', err);
+    console.error('Attachment download error:', err.message);
     res.status(500).json({ error: err.message || 'Download failed' });
   } finally {
     if (client) try { await client.logout(); } catch {}
