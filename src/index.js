@@ -417,7 +417,7 @@ app.post('/attachment', async (req, res) => {
       }
     } catch (err) {
       lastError = err;
-      console.error(`Attachment download error (attempt ${attempt}):`, err.message);
+      console.error(`Attachment download error (attempt ${attempt}):`, err.message, err.stack);
       if (client) try { await client.logout(); } catch {}
 
       // Wait before retry
@@ -427,6 +427,7 @@ app.post('/attachment', async (req, res) => {
     }
   }
 
+  console.error(`[Attachment] All retries failed for UID ${messageUid}, part ${partId}:`, lastError?.message);
   res.status(500).json({ error: lastError?.message || 'Download failed after retries' });
 });
 
