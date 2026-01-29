@@ -10,6 +10,7 @@
 import express from 'express';
 import cors from 'cors';
 import { ImapFlow } from 'imapflow';
+import crypto from 'crypto';
 
 const app = express();
 const PORT = process.env.PORT || 3001;
@@ -18,13 +19,90 @@ const PORT = process.env.PORT || 3001;
 app.use(cors());
 app.use(express.json({ limit: '50mb' }));
 
+// ============================================
+// Connection Pool for faster repeated requests
+// ============================================
+// Cache connections by hashed credentials to avoid storing actual passwords
+const connectionPool = new Map();
+const CONNECTION_TTL = 60000; // Keep connections alive for 60 seconds
+const MAX_POOL_SIZE = 10;
+
+// Hash credentials for safe storage (never store actual password)
+function hashCredentials(email, password) {
+  return crypto.createHash('sha256').update(`${email}:${password}`).digest('hex');
+}
+
+// Get or create a pooled connection
+async function getPooledClient(email, password, timeout = 30000) {
+  const hash = hashCredentials(email, password);
+  const cached = connectionPool.get(hash);
+
+  // Check if we have a valid cached connection
+  if (cached && cached.client && !cached.client.closed) {
+    cached.lastUsed = Date.now();
+    console.log(`[Pool] Reusing connection for ${email.substring(0, 3)}***`);
+    return { client: cached.client, fromPool: true };
+  }
+
+  // Remove stale entry if exists
+  if (cached) {
+    connectionPool.delete(hash);
+    try { await cached.client?.logout(); } catch {}
+  }
+
+  // Create new connection
+  console.log(`[Pool] Creating new connection for ${email.substring(0, 3)}***`);
+  const client = await createClientDirect(email, password, timeout);
+
+  // Store in pool (limit pool size)
+  if (connectionPool.size >= MAX_POOL_SIZE) {
+    // Remove oldest connection
+    let oldest = null;
+    let oldestTime = Infinity;
+    for (const [key, val] of connectionPool) {
+      if (val.lastUsed < oldestTime) {
+        oldest = key;
+        oldestTime = val.lastUsed;
+      }
+    }
+    if (oldest) {
+      const old = connectionPool.get(oldest);
+      connectionPool.delete(oldest);
+      try { await old.client?.logout(); } catch {}
+    }
+  }
+
+  connectionPool.set(hash, {
+    client,
+    lastUsed: Date.now(),
+  });
+
+  return { client, fromPool: false };
+}
+
+// Clean up old connections periodically
+setInterval(() => {
+  const now = Date.now();
+  for (const [hash, entry] of connectionPool) {
+    if (now - entry.lastUsed > CONNECTION_TTL) {
+      console.log('[Pool] Cleaning up idle connection');
+      connectionPool.delete(hash);
+      try { entry.client?.logout(); } catch {}
+    }
+  }
+}, 30000);
+
 // Health check
 app.get('/', (req, res) => {
-  res.json({ status: 'ok', service: 'orchestra-imap' });
+  res.json({
+    status: 'ok',
+    service: 'orchestra-imap',
+    poolSize: connectionPool.size
+  });
 });
 
-// Create IMAP client with timeout
-async function createClient(email, password, timeout = 30000) {
+// Create IMAP client directly (no pooling)
+async function createClientDirect(email, password, timeout = 30000) {
   const client = new ImapFlow({
     host: 'imap.gmail.com',
     port: 993,
@@ -36,6 +114,11 @@ async function createClient(email, password, timeout = 30000) {
   });
   await client.connect();
   return client;
+}
+
+// Create IMAP client with timeout (uses pool for attachment downloads)
+async function createClient(email, password, timeout = 30000) {
+  return createClientDirect(email, password, timeout);
 }
 
 // Test connection
@@ -365,6 +448,7 @@ async function streamToBuffer(stream) {
 
 // Download attachment using the proper client.download() method
 // This handles base64 decoding automatically and returns binary content
+// Uses connection pooling for faster repeated downloads
 app.post('/attachment', async (req, res) => {
   const { email, password, messageUid, partId } = req.body;
 
@@ -374,12 +458,22 @@ app.post('/attachment', async (req, res) => {
 
   const MAX_RETRIES = 3;
   let lastError = null;
+  let pooledClient = null;
 
   for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
     let client = null;
+    let fromPool = false;
     try {
-      client = await createClient(email, password, 30000);
-      await client.mailboxOpen('INBOX');
+      // Use pooled connection for faster downloads
+      const poolResult = await getPooledClient(email, password, 30000);
+      client = poolResult.client;
+      fromPool = poolResult.fromPool;
+      pooledClient = client;
+
+      // Only open mailbox if not already open or if connection is fresh
+      if (!fromPool || client.mailbox?.path !== 'INBOX') {
+        await client.mailboxOpen('INBOX');
+      }
 
       console.log(`[Attachment] Downloading UID ${messageUid}, part ${partId} (attempt ${attempt})`);
 
@@ -477,12 +571,13 @@ app.post('/attachment', async (req, res) => {
         throw new Error(`Downloaded content is not a valid PDF (got ${buffer.length} bytes, starts with: ${preview.substring(0, 50)})`);
       }
 
-      console.log(`[Attachment] Successfully downloaded PDF: ${buffer.length} bytes`);
+      console.log(`[Attachment] Successfully downloaded PDF: ${buffer.length} bytes (pooled: ${fromPool})`);
 
       // Convert to base64 for JSON response
       const base64 = buffer.toString('base64');
 
-      await client.logout();
+      // Don't logout - keep connection in pool for reuse
+      // The pool will clean it up after TTL expires
       return res.json({
         base64,
         filename: downloadResult.meta?.filename || 'document.pdf',
@@ -491,7 +586,13 @@ app.post('/attachment', async (req, res) => {
     } catch (err) {
       lastError = err;
       console.error(`[Attachment] Download error (attempt ${attempt}):`, err.message);
-      if (client) try { await client.logout(); } catch {}
+
+      // On error, remove from pool and close connection
+      if (client) {
+        const hash = hashCredentials(email, password);
+        connectionPool.delete(hash);
+        try { await client.logout(); } catch {}
+      }
 
       // Wait before retry with exponential backoff
       if (attempt < MAX_RETRIES) {
