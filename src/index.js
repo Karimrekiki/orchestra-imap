@@ -153,12 +153,30 @@ app.post('/search-stream', async (req, res) => {
     const PDF_BATCH_SIZE = 10;   // Send PDF batches every 10 PDFs found
     const scanStartTime = Date.now();
 
-    for await (const msg of client.fetch(
-      { since: sinceDate },
-      { envelope: true, bodyStructure: true, uid: true }
-    )) {
+    // First, search for all matching UIDs so we can process newest first
+    const searchResult = await client.search({ since: sinceDate }, { uid: true });
+    const allUids = Array.isArray(searchResult) ? searchResult : [];
+
+    // Sort UIDs in descending order (newest first - higher UID = newer)
+    allUids.sort((a, b) => b - a);
+
+    console.log(`[Search] Found ${allUids.length} emails since ${sinceDate.toISOString()}, processing newest first`);
+
+    // Process emails in batches to avoid memory issues
+    const FETCH_BATCH_SIZE = 100;
+    for (let i = 0; i < allUids.length; i += FETCH_BATCH_SIZE) {
+      const batchUids = allUids.slice(i, i + FETCH_BATCH_SIZE);
+      if (batchUids.length === 0) break;
+
+      // Fetch this batch of messages
+      for await (const msg of client.fetch(
+        batchUids,
+        { envelope: true, bodyStructure: true, uid: true },
+        { uid: true }
+      )) {
       // If resuming, skip messages until we pass the resume point
-      if (resumeAfterUid && msg.uid <= resumeAfterUid) {
+      // Note: With newest-first, resume logic is different - skip if UID >= resumeAfterUid
+      if (resumeAfterUid && msg.uid >= resumeAfterUid) {
         skippedToResume++;
         continue;
       }
@@ -197,21 +215,22 @@ app.post('/search-stream', async (req, res) => {
         const elapsed = Date.now() - scanStartTime;
         const scannedThisSession = totalEmailsScanned - previousScanned;
         const emailsPerSecond = scannedThisSession / (elapsed / 1000);
-        const remaining = totalInMailbox - totalEmailsScanned;
+        const remaining = allUids.length - (i + batchUids.length);
         const etaSeconds = emailsPerSecond > 0 ? Math.round(remaining / emailsPerSecond) : null;
 
         sendEvent({
           type: 'progress',
           scanned: totalEmailsScanned,
-          totalInMailbox,
+          totalInMailbox: allUids.length,
           withPdf: totalWithPdf,
-          percentComplete: Math.min(99, Math.round((totalEmailsScanned / totalInMailbox) * 100)),
+          percentComplete: Math.min(99, Math.round((totalEmailsScanned / allUids.length) * 100)),
           lastUid: lastProcessedUid,
           etaSeconds,
           emailsPerSecond: Math.round(emailsPerSecond)
         });
       }
-    }
+      } // End of inner for await loop
+    } // End of batch loop
 
     // Send any remaining pending messages
     if (pendingMessages.length > 0) {
@@ -245,6 +264,7 @@ app.post('/search-stream', async (req, res) => {
 
 // Search for emails with PDF attachments (non-streaming fallback)
 // Returns all matching emails (no artificial limit) with total count
+// Processes newest emails first for better UX
 app.post('/search', async (req, res) => {
   const { email, password, daysBack = 365, maxResults = 5000 } = req.body;
 
@@ -262,27 +282,42 @@ app.post('/search', async (req, res) => {
     const sinceDate = new Date();
     sinceDate.setDate(sinceDate.getDate() - effectiveDaysBack);
 
+    // Search for all matching UIDs so we can process newest first
+    const searchResult = await client.search({ since: sinceDate }, { uid: true });
+    const allUids = Array.isArray(searchResult) ? searchResult : [];
+
+    // Sort UIDs in descending order (newest first)
+    allUids.sort((a, b) => b - a);
+
     const messages = [];
     let totalEmailsScanned = 0;
     let totalWithPdf = 0;
 
-    for await (const msg of client.fetch(
-      { since: sinceDate },
-      { envelope: true, bodyStructure: true, uid: true }
-    )) {
-      totalEmailsScanned++;
+    // Process in batches
+    const FETCH_BATCH_SIZE = 100;
+    for (let i = 0; i < allUids.length; i += FETCH_BATCH_SIZE) {
+      const batchUids = allUids.slice(i, i + FETCH_BATCH_SIZE);
+      if (batchUids.length === 0) break;
 
-      const attachments = extractPdfAttachments(msg.bodyStructure);
-      if (attachments.length > 0) {
-        totalWithPdf++;
-        if (messages.length < maxResults) {
-          messages.push({
-            uid: msg.uid,
-            subject: msg.envelope.subject,
-            from: formatAddress(msg.envelope.from?.[0]),
-            date: msg.envelope.date?.toISOString(),
-            attachments
-          });
+      for await (const msg of client.fetch(
+        batchUids,
+        { envelope: true, bodyStructure: true, uid: true },
+        { uid: true }
+      )) {
+        totalEmailsScanned++;
+
+        const attachments = extractPdfAttachments(msg.bodyStructure);
+        if (attachments.length > 0) {
+          totalWithPdf++;
+          if (messages.length < maxResults) {
+            messages.push({
+              uid: msg.uid,
+              subject: msg.envelope.subject,
+              from: formatAddress(msg.envelope.from?.[0]),
+              date: msg.envelope.date?.toISOString(),
+              attachments
+            });
+          }
         }
       }
     }
