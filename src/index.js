@@ -23,14 +23,16 @@ app.get('/', (req, res) => {
   res.json({ status: 'ok', service: 'orchestra-imap' });
 });
 
-// Create IMAP client
-async function createClient(email, password) {
+// Create IMAP client with timeout
+async function createClient(email, password, timeout = 30000) {
   const client = new ImapFlow({
     host: 'imap.gmail.com',
     port: 993,
     secure: true,
     auth: { user: email, pass: password },
-    logger: false // Never log credentials
+    logger: false, // Never log credentials
+    socketTimeout: timeout,
+    greetingTimeout: 15000,
   });
   await client.connect();
   return client;
@@ -307,13 +309,14 @@ app.post('/attachment', async (req, res) => {
     return res.status(400).json({ error: 'Missing required parameters' });
   }
 
-  const MAX_RETRIES = 2;
+  const MAX_RETRIES = 3;
   let lastError = null;
 
   for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
     let client = null;
     try {
-      client = await createClient(email, password);
+      // Use shorter timeout for attachment downloads to fail fast and retry
+      client = await createClient(email, password, 20000);
       await client.mailboxOpen('INBOX');
 
       // Try to fetch the attachment using the partId
