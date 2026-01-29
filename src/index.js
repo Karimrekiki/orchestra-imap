@@ -91,8 +91,17 @@ app.post('/mailbox-stats', async (req, res) => {
 
 // Search for emails with PDF attachments - STREAMING version with real-time progress
 // Uses Server-Sent Events (SSE) to stream progress updates
+// Supports resuming from a specific UID for interrupted scans
 app.post('/search-stream', async (req, res) => {
-  const { email, password, daysBack = 365, maxResults = 5000 } = req.body;
+  const {
+    email,
+    password,
+    daysBack = 365,
+    maxResults = 5000,
+    resumeAfterUid = null,  // Resume after this UID (for interrupted scans)
+    previousScanned = 0,     // Count from previous partial scan
+    previousWithPdf = 0      // PDFs found in previous partial scan
+  } = req.body;
 
   if (!email || !password) {
     return res.status(400).json({ error: 'Email and password required' });
@@ -119,7 +128,10 @@ app.post('/search-stream', async (req, res) => {
     sendEvent({
       type: 'start',
       totalInMailbox,
-      estimatedPdfs: Math.round(totalInMailbox * 0.05) // ~5% typically have PDFs
+      estimatedPdfs: Math.round(totalInMailbox * 0.05), // ~5% typically have PDFs
+      resuming: !!resumeAfterUid,
+      previousScanned,
+      previousWithPdf
     });
 
     await client.mailboxOpen('INBOX');
@@ -130,15 +142,25 @@ app.post('/search-stream', async (req, res) => {
     sinceDate.setDate(sinceDate.getDate() - effectiveDaysBack);
 
     const messages = [];
-    let totalEmailsScanned = 0;
-    let totalWithPdf = 0;
+    let totalEmailsScanned = previousScanned;
+    let totalWithPdf = previousWithPdf;
+    let lastProcessedUid = resumeAfterUid;
+    let skippedToResume = 0;
     const PROGRESS_INTERVAL = 50; // Send progress every 50 emails
+    const scanStartTime = Date.now();
 
     for await (const msg of client.fetch(
       { since: sinceDate },
       { envelope: true, bodyStructure: true, uid: true }
     )) {
+      // If resuming, skip messages until we pass the resume point
+      if (resumeAfterUid && msg.uid <= resumeAfterUid) {
+        skippedToResume++;
+        continue;
+      }
+
       totalEmailsScanned++;
+      lastProcessedUid = msg.uid;
 
       const attachments = extractPdfAttachments(msg.bodyStructure);
       if (attachments.length > 0) {
@@ -155,13 +177,23 @@ app.post('/search-stream', async (req, res) => {
       }
 
       // Send progress updates periodically
-      if (totalEmailsScanned % PROGRESS_INTERVAL === 0) {
+      if ((totalEmailsScanned - previousScanned) % PROGRESS_INTERVAL === 0) {
+        // Calculate time estimate
+        const elapsed = Date.now() - scanStartTime;
+        const scannedThisSession = totalEmailsScanned - previousScanned;
+        const emailsPerSecond = scannedThisSession / (elapsed / 1000);
+        const remaining = totalInMailbox - totalEmailsScanned;
+        const etaSeconds = emailsPerSecond > 0 ? Math.round(remaining / emailsPerSecond) : null;
+
         sendEvent({
           type: 'progress',
           scanned: totalEmailsScanned,
           totalInMailbox,
           withPdf: totalWithPdf,
-          percentComplete: Math.min(99, Math.round((totalEmailsScanned / totalInMailbox) * 100))
+          percentComplete: Math.min(99, Math.round((totalEmailsScanned / totalInMailbox) * 100)),
+          lastUid: lastProcessedUid,
+          etaSeconds,
+          emailsPerSecond: Math.round(emailsPerSecond)
         });
       }
     }
@@ -174,7 +206,8 @@ app.post('/search-stream', async (req, res) => {
       messages,
       totalEmailsScanned,
       totalWithPdf,
-      daysBack: effectiveDaysBack
+      daysBack: effectiveDaysBack,
+      lastUid: lastProcessedUid
     });
 
     res.end();
