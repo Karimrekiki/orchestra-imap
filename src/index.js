@@ -459,13 +459,49 @@ app.post('/attachment', async (req, res) => {
           // This is a fallback for when bodyParts fetch fails
           const source = fullMsg.source.toString('utf-8');
 
-          // Find base64 content after the part boundary
-          const base64Match = source.match(/Content-Transfer-Encoding:\s*base64[\r\n]+[\r\n]+([\s\S]+?)(?=--|\r\n\r\n--)/i);
-          if (base64Match) {
-            const base64Content = base64Match[1].replace(/[\r\n\s]/g, '');
-            await client.logout();
-            return res.json({ base64: base64Content });
+          // Look for PDF attachment specifically by finding the part with application/pdf
+          // and then extracting its base64 content
+          const pdfPartMatch = source.match(
+            /Content-Type:\s*application\/pdf[^\r\n]*[\r\n]+(?:[^\r\n]+[\r\n]+)*?Content-Transfer-Encoding:\s*base64[\r\n]+[\r\n]+([\s\S]+?)(?=\r\n--)/i
+          );
+
+          if (pdfPartMatch) {
+            const base64Content = pdfPartMatch[1].replace(/[\r\n\s]/g, '');
+            // Validate it's actually a PDF (starts with %PDF = JVBERi in base64)
+            if (base64Content.startsWith('JVBERi')) {
+              await client.logout();
+              return res.json({ base64: base64Content });
+            }
           }
+
+          // Alternative: look for Content-Disposition: attachment with .pdf filename
+          const attachmentMatch = source.match(
+            /Content-Disposition:\s*attachment[^;]*;\s*filename="?([^";\r\n]*\.pdf)"?[\r\n]+(?:[^\r\n]+[\r\n]+)*?Content-Transfer-Encoding:\s*base64[\r\n]+[\r\n]+([\s\S]+?)(?=\r\n--)/i
+          );
+
+          if (attachmentMatch) {
+            const base64Content = attachmentMatch[2].replace(/[\r\n\s]/g, '');
+            if (base64Content.startsWith('JVBERi')) {
+              await client.logout();
+              return res.json({ base64: base64Content });
+            }
+          }
+
+          // Last resort: find any base64 block that starts with PDF magic bytes
+          const allBase64Blocks = source.matchAll(
+            /Content-Transfer-Encoding:\s*base64[\r\n]+[\r\n]+([\s\S]+?)(?=\r\n--)/gi
+          );
+
+          for (const match of allBase64Blocks) {
+            const base64Content = match[1].replace(/[\r\n\s]/g, '');
+            // Check if it starts with PDF magic bytes (%PDF = JVBERi in base64)
+            if (base64Content.startsWith('JVBERi')) {
+              await client.logout();
+              return res.json({ base64: base64Content });
+            }
+          }
+
+          console.log('[Attachment] No valid PDF found in raw source fallback');
         }
 
         throw fetchErr;
