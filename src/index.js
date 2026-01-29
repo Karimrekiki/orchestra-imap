@@ -142,11 +142,13 @@ app.post('/search-stream', async (req, res) => {
     sinceDate.setDate(sinceDate.getDate() - effectiveDaysBack);
 
     const messages = [];
+    const pendingMessages = []; // Messages waiting to be sent
     let totalEmailsScanned = previousScanned;
     let totalWithPdf = previousWithPdf;
     let lastProcessedUid = resumeAfterUid;
     let skippedToResume = 0;
     const PROGRESS_INTERVAL = 50; // Send progress every 50 emails
+    const PDF_BATCH_SIZE = 10;   // Send PDF batches every 10 PDFs found
     const scanStartTime = Date.now();
 
     for await (const msg of client.fetch(
@@ -166,13 +168,24 @@ app.post('/search-stream', async (req, res) => {
       if (attachments.length > 0) {
         totalWithPdf++;
         if (messages.length < maxResults) {
-          messages.push({
+          const pdfMsg = {
             uid: msg.uid,
             subject: msg.envelope.subject,
             from: formatAddress(msg.envelope.from?.[0]),
             date: msg.envelope.date?.toISOString(),
             attachments
-          });
+          };
+          messages.push(pdfMsg);
+          pendingMessages.push(pdfMsg);
+
+          // Send batch of PDFs for concurrent processing
+          if (pendingMessages.length >= PDF_BATCH_SIZE) {
+            sendEvent({
+              type: 'pdf_batch',
+              messages: pendingMessages.splice(0, pendingMessages.length),
+              totalWithPdfSoFar: totalWithPdf
+            });
+          }
         }
       }
 
@@ -198,12 +211,21 @@ app.post('/search-stream', async (req, res) => {
       }
     }
 
+    // Send any remaining pending messages
+    if (pendingMessages.length > 0) {
+      sendEvent({
+        type: 'pdf_batch',
+        messages: pendingMessages,
+        totalWithPdfSoFar: totalWithPdf
+      });
+    }
+
     await client.logout();
 
-    // Send final complete event with all messages
+    // Send final complete event (messages already sent via pdf_batch events)
     sendEvent({
       type: 'complete',
-      messages,
+      messages: [], // Messages already streamed via pdf_batch
       totalEmailsScanned,
       totalWithPdf,
       daysBack: effectiveDaysBack,
@@ -277,7 +299,7 @@ app.post('/search', async (req, res) => {
   }
 });
 
-// Download attachment
+// Download attachment with retry logic
 app.post('/attachment', async (req, res) => {
   const { email, password, messageUid, partId } = req.body;
 
@@ -285,88 +307,127 @@ app.post('/attachment', async (req, res) => {
     return res.status(400).json({ error: 'Missing required parameters' });
   }
 
-  let client = null;
-  try {
-    client = await createClient(email, password);
-    await client.mailboxOpen('INBOX');
+  const MAX_RETRIES = 2;
+  let lastError = null;
 
-    // Try to fetch the attachment using the partId
-    // partId format can be "1", "1.2", "2.1", etc.
-    console.log(`[Attachment] Fetching UID ${messageUid}, part ${partId}`);
-
+  for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+    let client = null;
     try {
-      const msg = await client.fetchOne(
-        messageUid,
-        { bodyParts: [partId] },
-        { uid: true }
-      );
+      client = await createClient(email, password);
+      await client.mailboxOpen('INBOX');
 
-      if (!msg || !msg.bodyParts || !msg.bodyParts.has(partId)) {
-        // Try alternative part ID format (some servers use different numbering)
-        console.log(`[Attachment] Part ${partId} not found, trying alternatives...`);
+      // Try to fetch the attachment using the partId
+      // partId format can be "1", "1.2", "2.1", etc.
+      console.log(`[Attachment] Fetching UID ${messageUid}, part ${partId} (attempt ${attempt})`);
 
-        // Get message structure to find correct part
-        const structMsg = await client.fetchOne(
+      try {
+        const msg = await client.fetchOne(
           messageUid,
-          { bodyStructure: true },
+          { bodyParts: [partId] },
           { uid: true }
         );
 
-        if (structMsg?.bodyStructure) {
-          const allParts = [];
-          function collectParts(part, path = '1') {
-            allParts.push({ path, part });
-            if (part.childNodes) {
-              part.childNodes.forEach((child, idx) => {
-                collectParts(child, `${path}.${idx + 1}`);
-              });
+        if (!msg || !msg.bodyParts || !msg.bodyParts.has(partId)) {
+          // Try alternative part ID format (some servers use different numbering)
+          console.log(`[Attachment] Part ${partId} not found, trying alternatives...`);
+
+          // Get message structure to find correct part
+          const structMsg = await client.fetchOne(
+            messageUid,
+            { bodyStructure: true },
+            { uid: true }
+          );
+
+          if (structMsg?.bodyStructure) {
+            const allParts = [];
+            function collectParts(part, path = '1') {
+              allParts.push({ path, part });
+              if (part.childNodes) {
+                part.childNodes.forEach((child, idx) => {
+                  collectParts(child, `${path}.${idx + 1}`);
+                });
+              }
             }
+            collectParts(structMsg.bodyStructure);
+
+            // Try to find a PDF attachment by checking the available parts
+            let pdfPart = null;
+            for (const { path, part } of allParts) {
+              const mimeType = `${part.type || ''}/${part.subtype || ''}`.toLowerCase();
+              const filename = part.dispositionParameters?.filename || part.parameters?.name || '';
+              if (mimeType === 'application/pdf' || filename.toLowerCase().endsWith('.pdf')) {
+                pdfPart = path;
+                break;
+              }
+            }
+
+            if (pdfPart && pdfPart !== partId) {
+              console.log(`[Attachment] Found PDF at alternative part ${pdfPart}, trying...`);
+              const altMsg = await client.fetchOne(
+                messageUid,
+                { bodyParts: [pdfPart] },
+                { uid: true }
+              );
+              if (altMsg?.bodyParts?.has(pdfPart)) {
+                const buffer = altMsg.bodyParts.get(pdfPart);
+                const base64 = buffer.toString('base64');
+                await client.logout();
+                return res.json({ base64 });
+              }
+            }
+
+            console.log(`[Attachment] Available parts: ${allParts.map(p => p.path).join(', ')}`);
           }
-          collectParts(structMsg.bodyStructure);
-          console.log(`[Attachment] Available parts: ${allParts.map(p => p.path).join(', ')}`);
+
+          await client.logout();
+          return res.status(404).json({ error: `Attachment part ${partId} not found` });
         }
 
-        return res.status(404).json({ error: `Attachment part ${partId} not found` });
-      }
+        const buffer = msg.bodyParts.get(partId);
+        const base64 = buffer.toString('base64');
 
-      const buffer = msg.bodyParts.get(partId);
-      const base64 = buffer.toString('base64');
+        await client.logout();
+        return res.json({ base64 });
+      } catch (fetchErr) {
+        console.error(`[Attachment] Fetch error for part ${partId}:`, fetchErr.message);
 
-      await client.logout();
-      res.json({ base64 });
-    } catch (fetchErr) {
-      console.error(`[Attachment] Fetch error for part ${partId}:`, fetchErr.message);
+        // If the fetch fails, try downloading the entire message source and extract
+        console.log(`[Attachment] Trying full message download as fallback...`);
+        const fullMsg = await client.fetchOne(
+          messageUid,
+          { source: true, bodyStructure: true },
+          { uid: true }
+        );
 
-      // If the fetch fails, try downloading the entire message source and extract
-      console.log(`[Attachment] Trying full message download as fallback...`);
-      const fullMsg = await client.fetchOne(
-        messageUid,
-        { source: true, bodyStructure: true },
-        { uid: true }
-      );
+        if (fullMsg?.source) {
+          // Try to extract the attachment from the raw source
+          // This is a fallback for when bodyParts fetch fails
+          const source = fullMsg.source.toString('utf-8');
 
-      if (fullMsg?.source) {
-        // Try to extract the attachment from the raw source
-        // This is a fallback for when bodyParts fetch fails
-        const source = fullMsg.source.toString('utf-8');
-
-        // Find base64 content after the part boundary
-        const base64Match = source.match(/Content-Transfer-Encoding:\s*base64[\r\n]+[\r\n]+([\s\S]+?)(?=--|\r\n\r\n--)/i);
-        if (base64Match) {
-          const base64Content = base64Match[1].replace(/[\r\n\s]/g, '');
-          res.json({ base64: base64Content });
-          return;
+          // Find base64 content after the part boundary
+          const base64Match = source.match(/Content-Transfer-Encoding:\s*base64[\r\n]+[\r\n]+([\s\S]+?)(?=--|\r\n\r\n--)/i);
+          if (base64Match) {
+            const base64Content = base64Match[1].replace(/[\r\n\s]/g, '');
+            await client.logout();
+            return res.json({ base64: base64Content });
+          }
         }
-      }
 
-      throw fetchErr;
+        throw fetchErr;
+      }
+    } catch (err) {
+      lastError = err;
+      console.error(`Attachment download error (attempt ${attempt}):`, err.message);
+      if (client) try { await client.logout(); } catch {}
+
+      // Wait before retry
+      if (attempt < MAX_RETRIES) {
+        await new Promise(resolve => setTimeout(resolve, 1000 * attempt));
+      }
     }
-  } catch (err) {
-    console.error('Attachment download error:', err.message);
-    res.status(500).json({ error: err.message || 'Download failed' });
-  } finally {
-    if (client) try { await client.logout(); } catch {}
   }
+
+  res.status(500).json({ error: lastError?.message || 'Download failed after retries' });
 });
 
 // Search for emails by text query (for text invoice scanning)
