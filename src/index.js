@@ -66,8 +66,9 @@ app.post('/test', async (req, res) => {
 });
 
 // Search for emails with PDF attachments
+// Returns all matching emails (no artificial limit) with total count
 app.post('/search', async (req, res) => {
-  const { email, password, daysBack = 30, maxResults = 100 } = req.body;
+  const { email, password, daysBack = 30, maxResults = 500 } = req.body;
 
   if (!email || !password) {
     return res.status(400).json({ error: 'Email and password required' });
@@ -82,29 +83,37 @@ app.post('/search', async (req, res) => {
     sinceDate.setDate(sinceDate.getDate() - daysBack);
 
     const messages = [];
-    let count = 0;
+    let totalEmailsScanned = 0;
+    let totalWithPdf = 0;
 
     for await (const msg of client.fetch(
       { since: sinceDate },
       { envelope: true, bodyStructure: true, uid: true }
     )) {
-      if (count >= maxResults) break;
+      totalEmailsScanned++;
 
       const attachments = extractPdfAttachments(msg.bodyStructure);
       if (attachments.length > 0) {
-        messages.push({
-          uid: msg.uid,
-          subject: msg.envelope.subject,
-          from: formatAddress(msg.envelope.from?.[0]),
-          date: msg.envelope.date?.toISOString(),
-          attachments
-        });
-        count++;
+        totalWithPdf++;
+        if (messages.length < maxResults) {
+          messages.push({
+            uid: msg.uid,
+            subject: msg.envelope.subject,
+            from: formatAddress(msg.envelope.from?.[0]),
+            date: msg.envelope.date?.toISOString(),
+            attachments
+          });
+        }
       }
     }
 
     await client.logout();
-    res.json({ messages });
+    res.json({
+      messages,
+      totalEmailsScanned,
+      totalWithPdf,
+      daysBack
+    });
   } catch (err) {
     res.status(500).json({ error: err.message || 'Search failed' });
   } finally {
