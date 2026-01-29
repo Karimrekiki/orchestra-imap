@@ -65,7 +65,128 @@ app.post('/test', async (req, res) => {
   }
 });
 
-// Search for emails with PDF attachments
+// Get mailbox stats quickly (for progress estimation)
+app.post('/mailbox-stats', async (req, res) => {
+  const { email, password } = req.body;
+
+  if (!email || !password) {
+    return res.status(400).json({ error: 'Email and password required' });
+  }
+
+  let client = null;
+  try {
+    client = await createClient(email, password);
+    const status = await client.status('INBOX', { messages: true, recent: true });
+    await client.logout();
+    res.json({
+      totalMessages: status.messages,
+      recentMessages: status.recent
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message || 'Failed to get mailbox stats' });
+  } finally {
+    if (client) try { await client.logout(); } catch {}
+  }
+});
+
+// Search for emails with PDF attachments - STREAMING version with real-time progress
+// Uses Server-Sent Events (SSE) to stream progress updates
+app.post('/search-stream', async (req, res) => {
+  const { email, password, daysBack = 365, maxResults = 5000 } = req.body;
+
+  if (!email || !password) {
+    return res.status(400).json({ error: 'Email and password required' });
+  }
+
+  // Set SSE headers
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection', 'keep-alive');
+  res.setHeader('X-Accel-Buffering', 'no'); // Disable nginx buffering
+
+  const sendEvent = (data) => {
+    res.write(`data: ${JSON.stringify(data)}\n\n`);
+  };
+
+  let client = null;
+  try {
+    client = await createClient(email, password);
+
+    // First, get total message count for progress estimation
+    const status = await client.status('INBOX', { messages: true });
+    const totalInMailbox = status.messages;
+
+    sendEvent({
+      type: 'start',
+      totalInMailbox,
+      estimatedPdfs: Math.round(totalInMailbox * 0.05) // ~5% typically have PDFs
+    });
+
+    await client.mailboxOpen('INBOX');
+
+    // Handle "all time" scan when daysBack is very large (3650 = ~10 years)
+    const effectiveDaysBack = daysBack >= 3650 ? 3650 : (daysBack || 365);
+    const sinceDate = new Date();
+    sinceDate.setDate(sinceDate.getDate() - effectiveDaysBack);
+
+    const messages = [];
+    let totalEmailsScanned = 0;
+    let totalWithPdf = 0;
+    const PROGRESS_INTERVAL = 50; // Send progress every 50 emails
+
+    for await (const msg of client.fetch(
+      { since: sinceDate },
+      { envelope: true, bodyStructure: true, uid: true }
+    )) {
+      totalEmailsScanned++;
+
+      const attachments = extractPdfAttachments(msg.bodyStructure);
+      if (attachments.length > 0) {
+        totalWithPdf++;
+        if (messages.length < maxResults) {
+          messages.push({
+            uid: msg.uid,
+            subject: msg.envelope.subject,
+            from: formatAddress(msg.envelope.from?.[0]),
+            date: msg.envelope.date?.toISOString(),
+            attachments
+          });
+        }
+      }
+
+      // Send progress updates periodically
+      if (totalEmailsScanned % PROGRESS_INTERVAL === 0) {
+        sendEvent({
+          type: 'progress',
+          scanned: totalEmailsScanned,
+          totalInMailbox,
+          withPdf: totalWithPdf,
+          percentComplete: Math.min(99, Math.round((totalEmailsScanned / totalInMailbox) * 100))
+        });
+      }
+    }
+
+    await client.logout();
+
+    // Send final complete event with all messages
+    sendEvent({
+      type: 'complete',
+      messages,
+      totalEmailsScanned,
+      totalWithPdf,
+      daysBack: effectiveDaysBack
+    });
+
+    res.end();
+  } catch (err) {
+    sendEvent({ type: 'error', error: err.message || 'Search failed' });
+    res.end();
+  } finally {
+    if (client) try { await client.logout(); } catch {}
+  }
+});
+
+// Search for emails with PDF attachments (non-streaming fallback)
 // Returns all matching emails (no artificial limit) with total count
 app.post('/search', async (req, res) => {
   const { email, password, daysBack = 365, maxResults = 5000 } = req.body;
@@ -114,7 +235,7 @@ app.post('/search', async (req, res) => {
       messages,
       totalEmailsScanned,
       totalWithPdf,
-      daysBack
+      daysBack: effectiveDaysBack
     });
   } catch (err) {
     res.status(500).json({ error: err.message || 'Search failed' });
