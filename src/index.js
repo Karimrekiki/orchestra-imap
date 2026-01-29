@@ -353,7 +353,18 @@ app.post('/search', async (req, res) => {
   }
 });
 
-// Download attachment with retry logic
+// Helper function to collect stream into buffer
+async function streamToBuffer(stream) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    stream.on('data', (chunk) => chunks.push(chunk));
+    stream.on('end', () => resolve(Buffer.concat(chunks)));
+    stream.on('error', reject);
+  });
+}
+
+// Download attachment using the proper client.download() method
+// This handles base64 decoding automatically and returns binary content
 app.post('/attachment', async (req, res) => {
   const { email, password, messageUid, partId } = req.body;
 
@@ -367,153 +378,126 @@ app.post('/attachment', async (req, res) => {
   for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
     let client = null;
     try {
-      // Use shorter timeout for attachment downloads to fail fast and retry
-      client = await createClient(email, password, 20000);
+      client = await createClient(email, password, 30000);
       await client.mailboxOpen('INBOX');
 
-      // Try to fetch the attachment using the partId
-      // partId format can be "1", "1.2", "2.1", etc.
-      console.log(`[Attachment] Fetching UID ${messageUid}, part ${partId} (attempt ${attempt})`);
+      console.log(`[Attachment] Downloading UID ${messageUid}, part ${partId} (attempt ${attempt})`);
 
+      // Use the proper download() method - this handles base64 decoding automatically
+      // and returns a stream of the binary attachment content
+      let downloadResult;
       try {
-        const msg = await client.fetchOne(
+        downloadResult = await client.download(messageUid, partId, { uid: true });
+      } catch (downloadErr) {
+        console.log(`[Attachment] Direct download failed for part ${partId}: ${downloadErr.message}`);
+
+        // If direct download fails, try to find the correct part by examining structure
+        const structMsg = await client.fetchOne(
           messageUid,
-          { bodyParts: [partId] },
+          { bodyStructure: true },
           { uid: true }
         );
 
-        if (!msg || !msg.bodyParts || !msg.bodyParts.has(partId)) {
-          // Try alternative part ID format (some servers use different numbering)
-          console.log(`[Attachment] Part ${partId} not found, trying alternatives...`);
-
-          // Get message structure to find correct part
-          const structMsg = await client.fetchOne(
-            messageUid,
-            { bodyStructure: true },
-            { uid: true }
-          );
-
-          if (structMsg?.bodyStructure) {
-            const allParts = [];
-            function collectParts(part, path = '1') {
-              allParts.push({ path, part });
-              if (part.childNodes) {
-                part.childNodes.forEach((child, idx) => {
-                  collectParts(child, `${path}.${idx + 1}`);
-                });
-              }
-            }
-            collectParts(structMsg.bodyStructure);
-
-            // Try to find a PDF attachment by checking the available parts
-            let pdfPart = null;
-            for (const { path, part } of allParts) {
-              const mimeType = `${part.type || ''}/${part.subtype || ''}`.toLowerCase();
-              const filename = part.dispositionParameters?.filename || part.parameters?.name || '';
-              if (mimeType === 'application/pdf' || filename.toLowerCase().endsWith('.pdf')) {
-                pdfPart = path;
-                break;
-              }
-            }
-
-            if (pdfPart && pdfPart !== partId) {
-              console.log(`[Attachment] Found PDF at alternative part ${pdfPart}, trying...`);
-              const altMsg = await client.fetchOne(
-                messageUid,
-                { bodyParts: [pdfPart] },
-                { uid: true }
-              );
-              if (altMsg?.bodyParts?.has(pdfPart)) {
-                const buffer = altMsg.bodyParts.get(pdfPart);
-                const base64 = buffer.toString('base64');
-                await client.logout();
-                return res.json({ base64 });
-              }
-            }
-
-            console.log(`[Attachment] Available parts: ${allParts.map(p => p.path).join(', ')}`);
-          }
-
-          await client.logout();
-          return res.status(404).json({ error: `Attachment part ${partId} not found` });
+        if (!structMsg?.bodyStructure) {
+          throw new Error('Could not get message structure');
         }
 
-        const buffer = msg.bodyParts.get(partId);
-        const base64 = buffer.toString('base64');
+        // Find all PDF parts in the message
+        const pdfParts = [];
+        function findPdfParts(part, path = '') {
+          // Build the correct part path
+          // Root level multipart doesn't have a part number
+          // First child is "1", second is "2", etc.
+          // Nested parts are "1.1", "1.2", "2.1", etc.
 
-        await client.logout();
-        return res.json({ base64 });
-      } catch (fetchErr) {
-        console.error(`[Attachment] Fetch error for part ${partId}:`, fetchErr.message);
+          const mimeType = `${part.type || ''}/${part.subtype || ''}`.toLowerCase();
+          const filename = part.dispositionParameters?.filename || part.parameters?.name || '';
 
-        // If the fetch fails, try downloading the entire message source and extract
-        console.log(`[Attachment] Trying full message download as fallback...`);
-        const fullMsg = await client.fetchOne(
-          messageUid,
-          { source: true, bodyStructure: true },
-          { uid: true }
-        );
-
-        if (fullMsg?.source) {
-          // Try to extract the attachment from the raw source
-          // This is a fallback for when bodyParts fetch fails
-          const source = fullMsg.source.toString('utf-8');
-
-          // Look for PDF attachment specifically by finding the part with application/pdf
-          // and then extracting its base64 content
-          const pdfPartMatch = source.match(
-            /Content-Type:\s*application\/pdf[^\r\n]*[\r\n]+(?:[^\r\n]+[\r\n]+)*?Content-Transfer-Encoding:\s*base64[\r\n]+[\r\n]+([\s\S]+?)(?=\r\n--)/i
-          );
-
-          if (pdfPartMatch) {
-            const base64Content = pdfPartMatch[1].replace(/[\r\n\s]/g, '');
-            // Validate it's actually a PDF (starts with %PDF = JVBERi in base64)
-            if (base64Content.startsWith('JVBERi')) {
-              await client.logout();
-              return res.json({ base64: base64Content });
-            }
+          if (mimeType === 'application/pdf' || filename.toLowerCase().endsWith('.pdf')) {
+            pdfParts.push({
+              path: path || '1',
+              filename,
+              size: part.size,
+              encoding: part.encoding
+            });
           }
 
-          // Alternative: look for Content-Disposition: attachment with .pdf filename
-          const attachmentMatch = source.match(
-            /Content-Disposition:\s*attachment[^;]*;\s*filename="?([^";\r\n]*\.pdf)"?[\r\n]+(?:[^\r\n]+[\r\n]+)*?Content-Transfer-Encoding:\s*base64[\r\n]+[\r\n]+([\s\S]+?)(?=\r\n--)/i
-          );
-
-          if (attachmentMatch) {
-            const base64Content = attachmentMatch[2].replace(/[\r\n\s]/g, '');
-            if (base64Content.startsWith('JVBERi')) {
-              await client.logout();
-              return res.json({ base64: base64Content });
-            }
+          if (part.childNodes) {
+            part.childNodes.forEach((child, idx) => {
+              const childPath = path ? `${path}.${idx + 1}` : `${idx + 1}`;
+              findPdfParts(child, childPath);
+            });
           }
+        }
+        findPdfParts(structMsg.bodyStructure);
 
-          // Last resort: find any base64 block that starts with PDF magic bytes
-          const allBase64Blocks = source.matchAll(
-            /Content-Transfer-Encoding:\s*base64[\r\n]+[\r\n]+([\s\S]+?)(?=\r\n--)/gi
-          );
+        console.log(`[Attachment] Found PDF parts: ${JSON.stringify(pdfParts)}`);
 
-          for (const match of allBase64Blocks) {
-            const base64Content = match[1].replace(/[\r\n\s]/g, '');
-            // Check if it starts with PDF magic bytes (%PDF = JVBERi in base64)
-            if (base64Content.startsWith('JVBERi')) {
-              await client.logout();
-              return res.json({ base64: base64Content });
-            }
-          }
-
-          console.log('[Attachment] No valid PDF found in raw source fallback');
+        if (pdfParts.length === 0) {
+          throw new Error('No PDF attachments found in message');
         }
 
-        throw fetchErr;
+        // Try each PDF part until we find one that works
+        let foundPdf = false;
+        for (const pdfPart of pdfParts) {
+          try {
+            console.log(`[Attachment] Trying PDF part ${pdfPart.path} (${pdfPart.filename})`);
+            downloadResult = await client.download(messageUid, pdfPart.path, { uid: true });
+            foundPdf = true;
+            break;
+          } catch (partErr) {
+            console.log(`[Attachment] Part ${pdfPart.path} failed: ${partErr.message}`);
+          }
+        }
+
+        if (!foundPdf) {
+          throw new Error('Could not download any PDF attachment');
+        }
       }
+
+      if (!downloadResult || !downloadResult.content) {
+        throw new Error('No content returned from download');
+      }
+
+      // Collect the stream into a buffer
+      const buffer = await streamToBuffer(downloadResult.content);
+
+      if (buffer.length === 0) {
+        throw new Error('Downloaded attachment is empty');
+      }
+
+      // Validate it's a PDF by checking magic bytes
+      // PDF files start with %PDF (hex: 25 50 44 46)
+      const isPdf = buffer[0] === 0x25 && buffer[1] === 0x50 && buffer[2] === 0x44 && buffer[3] === 0x46;
+
+      if (!isPdf) {
+        // Log what we actually got for debugging
+        const preview = buffer.slice(0, 100).toString('utf-8');
+        console.error(`[Attachment] Downloaded content is not a PDF. Preview: ${preview}`);
+        throw new Error(`Downloaded content is not a valid PDF (got ${buffer.length} bytes, starts with: ${preview.substring(0, 50)})`);
+      }
+
+      console.log(`[Attachment] Successfully downloaded PDF: ${buffer.length} bytes`);
+
+      // Convert to base64 for JSON response
+      const base64 = buffer.toString('base64');
+
+      await client.logout();
+      return res.json({
+        base64,
+        filename: downloadResult.meta?.filename || 'document.pdf',
+        size: buffer.length
+      });
     } catch (err) {
       lastError = err;
-      console.error(`Attachment download error (attempt ${attempt}):`, err.message, err.stack);
+      console.error(`[Attachment] Download error (attempt ${attempt}):`, err.message);
       if (client) try { await client.logout(); } catch {}
 
-      // Wait before retry
+      // Wait before retry with exponential backoff
       if (attempt < MAX_RETRIES) {
-        await new Promise(resolve => setTimeout(resolve, 1000 * attempt));
+        const waitMs = 1000 * Math.pow(2, attempt - 1);
+        console.log(`[Attachment] Waiting ${waitMs}ms before retry...`);
+        await new Promise(resolve => setTimeout(resolve, waitMs));
       }
     }
   }
@@ -630,28 +614,38 @@ app.post('/message', async (req, res) => {
 });
 
 // Extract PDF attachments from body structure
+// Part numbering for IMAP BODYSTRUCTURE:
+// - For simple messages: part "1" is the body
+// - For multipart messages: children are numbered "1", "2", "3", etc.
+// - Nested parts are "1.1", "1.2", "2.1", etc.
 function extractPdfAttachments(bodyStructure) {
   const attachments = [];
 
-  function walk(part, partId = '1') {
+  function walk(part, path = '') {
     if (!part) return;
 
     const mimeType = `${part.type || ''}/${part.subtype || ''}`.toLowerCase();
     const filename = part.dispositionParameters?.filename ||
                      part.parameters?.name || '';
 
+    // For non-multipart, the part ID is the path or "1" if root
+    const isMultipart = mimeType.startsWith('multipart/');
+
     if (mimeType === 'application/pdf' || filename.toLowerCase().endsWith('.pdf')) {
       attachments.push({
         filename: filename || 'document.pdf',
         mimeType,
         size: part.size || 0,
-        partId
+        partId: path || '1',
+        encoding: part.encoding
       });
     }
 
     if (part.childNodes) {
       part.childNodes.forEach((child, index) => {
-        walk(child, `${partId}.${index + 1}`);
+        // Child numbering starts at 1
+        const childPath = path ? `${path}.${index + 1}` : `${index + 1}`;
+        walk(child, childPath);
       });
     }
   }
