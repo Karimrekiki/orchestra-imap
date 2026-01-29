@@ -94,13 +94,15 @@ app.post('/mailbox-stats', async (req, res) => {
 // Search for emails with PDF attachments - STREAMING version with real-time progress
 // Uses Server-Sent Events (SSE) to stream progress updates
 // Supports resuming from a specific UID for interrupted scans
+// Supports incremental scanning with sinceUid for periodic updates
 app.post('/search-stream', async (req, res) => {
   const {
     email,
     password,
     daysBack = 365,
     maxResults = 5000,
-    resumeAfterUid = null,  // Resume after this UID (for interrupted scans)
+    resumeAfterUid = null,  // Resume after this UID (for interrupted scans - lower bound)
+    sinceUid = null,        // Only fetch emails with UID > sinceUid (for incremental scans)
     previousScanned = 0,     // Count from previous partial scan
     previousWithPdf = 0      // PDFs found in previous partial scan
   } = req.body;
@@ -127,11 +129,14 @@ app.post('/search-stream', async (req, res) => {
     const status = await client.status('INBOX', { messages: true });
     const totalInMailbox = status.messages;
 
+    const isIncremental = !!sinceUid;
     sendEvent({
       type: 'start',
       totalInMailbox,
-      estimatedPdfs: Math.round(totalInMailbox * 0.05), // ~5% typically have PDFs
+      estimatedPdfs: isIncremental ? 10 : Math.round(totalInMailbox * 0.05), // Fewer expected for incremental
       resuming: !!resumeAfterUid,
+      incremental: isIncremental,
+      sinceUid,
       previousScanned,
       previousWithPdf
     });
@@ -154,13 +159,25 @@ app.post('/search-stream', async (req, res) => {
     const scanStartTime = Date.now();
 
     // First, search for all matching UIDs so we can process newest first
-    const searchResult = await client.search({ since: sinceDate }, { uid: true });
+    // For incremental scans, we use UID range instead of date filter
+    let searchCriteria;
+    if (sinceUid) {
+      // Incremental scan: only emails newer than sinceUid
+      searchCriteria = { uid: `${sinceUid + 1}:*` };
+      console.log(`[Search] Incremental scan for emails with UID > ${sinceUid}`);
+    } else {
+      // Full scan: use date filter
+      searchCriteria = { since: sinceDate };
+    }
+
+    const searchResult = await client.search(searchCriteria, { uid: true });
     const allUids = Array.isArray(searchResult) ? searchResult : [];
 
     // Sort UIDs in descending order (newest first - higher UID = newer)
     allUids.sort((a, b) => b - a);
 
-    console.log(`[Search] Found ${allUids.length} emails since ${sinceDate.toISOString()}, processing newest first`);
+    const scanType = sinceUid ? `incremental (UID > ${sinceUid})` : `full (since ${sinceDate.toISOString()})`;
+    console.log(`[Search] Found ${allUids.length} emails for ${scanType} scan, processing newest first`);
 
     // Process emails in batches to avoid memory issues
     const FETCH_BATCH_SIZE = 100;
